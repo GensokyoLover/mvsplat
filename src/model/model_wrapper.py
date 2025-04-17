@@ -13,6 +13,7 @@ from pytorch_lightning.utilities import rank_zero_only
 from torch import Tensor, nn, optim
 import numpy as np
 import json
+import pyexr
 
 from ..dataset.data_module import get_data_shim
 from ..dataset.types import BatchedExample
@@ -29,6 +30,8 @@ from ..visualization.camera_trajectory.interpolation import (
     interpolate_extrinsics,
     interpolate_intrinsics,
 )
+import open3d as o3d
+from pyntcloud import PyntCloud
 from ..visualization.camera_trajectory.wobble import (
     generate_wobble,
     generate_wobble_transformation,
@@ -128,6 +131,7 @@ class ModelWrapper(LightningModule):
         gaussians = self.encoder(
             batch["context"], self.global_step, False, scene_names=batch["scene"]
         )
+
         output = self.decoder.forward(
             gaussians,
             batch["target"]["extrinsics"],
@@ -137,9 +141,11 @@ class ModelWrapper(LightningModule):
             (h, w),
             depth_mode=self.train_cfg.depth_mode,
         )
+
         target_gt = batch["target"]["image"]
 
-        # Compute metrics.
+        #target_positions = batch["target"]["positions"]
+
         psnr_probabilistic = compute_psnr(
             rearrange(target_gt, "b v c h w -> (b v) c h w"),
             rearrange(output.color, "b v c h w -> (b v) c h w"),
@@ -150,8 +156,15 @@ class ModelWrapper(LightningModule):
         total_loss = 0
         for loss_fn in self.losses:
             loss = loss_fn.forward(output, batch, gaussians, self.global_step)
+
             self.log(f"loss/{loss_fn.name}", loss)
             total_loss = total_loss + loss
+        # print("------------")
+        # print(gaussians.means.shape)
+        # print(batch["context"]["positions"].shape)
+        #total_loss = torch.abs(gaussians.means.reshape(-1,3) -batch["context"]["positions"].reshape(-1,3)).mean()
+        print("total loss" ,total_loss)
+
         self.log("loss/total", total_loss)
 
         if (
@@ -166,6 +179,26 @@ class ModelWrapper(LightningModule):
                 f"{batch['context']['far'].detach().cpu().numpy().mean()}]; "
                 f"loss = {total_loss:.6f}"
             )
+            cloud = gaussians.means.reshape(-1,3).detach().cpu().numpy()
+            # 创建 PointCloud 对象
+            pcd = o3d.geometry.PointCloud()
+
+            # 设置点云的坐标
+            pcd.points = o3d.utility.Vector3dVector(cloud)
+
+            # 保存为 .ply 文件
+            o3d.io.write_point_cloud("./outputs/point_cloud.ply", pcd)
+            # print(type(target_depth))
+            # print(len(target_depth))
+            # print(target_depth[0].shape)
+            for i in range(4):
+                pyexr.write("./outputs/gt{}.exr".format(i),target_gt[0,i].permute(1,2,0).detach().cpu().numpy())
+                #pyexr.write("./outputs/gt_position{}.exr".format(i),target_positions[0,i].reshape(3,256,256).permute(1,2,0).detach().cpu().numpy())
+                pyexr.write("./outputs/result{}.exr".format(i),output.color[0,i].permute(1,2,0).detach().cpu().numpy())
+                #pyexr.write("./outputs/result_position{}.exr".format(i),output.[0,i].reshape(1,256,256).permute(1,2,0).detach().cpu().numpy())
+            for i in range(4):
+                pyexr.write("./outputs/gaussian_mean{}.exr".format(i),gaussians.means.reshape(4,256,256,3)[i].detach().cpu().numpy())
+                pyexr.write("./outputs/context_image{}.exr".format(i),batch["context"]["image"].reshape(4,3,256,256)[i].permute(1,2,0).detach().cpu().numpy())
         self.log("info/near", batch["context"]["near"].detach().cpu().numpy().mean())
         self.log("info/far", batch["context"]["far"].detach().cpu().numpy().mean())
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
@@ -173,6 +206,7 @@ class ModelWrapper(LightningModule):
         # Tell the data loader processes about the current step.
         if self.step_tracker is not None:
             self.step_tracker.set_step(self.global_step)
+        #total_loss.backward()
 
         return total_loss
 
